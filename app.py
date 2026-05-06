@@ -3,6 +3,8 @@ import json
 import numpy as np
 import re
 import os
+import time
+import hashlib
 import requests
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -204,14 +206,27 @@ def build_primer_sekunder_text() -> str:
             lines.append(f"  [SEKUNDER] {skode}: {sdata['uraian']}")
     return "\n".join(lines)
 
-def call_gemini(perihal: str, api_key: str) -> dict:
+
+# ─── Konstanta Rate Limiting ──────────────────────────────────────────────────
+# Gemini Free Tier limits:
+#   - 15 RPM  (requests per minute)  → min jeda 4 detik antar request
+#   - 1.500 RPD (requests per day)
+#   - Gemini 2.5 Flash Preview: lebih ketat, hanya 10 RPM
+COOLDOWN_SECONDS = 6          # jeda minimum antar submit (detik)
+RETRY_WAIT_SECONDS = 65       # tunggu setelah 429 sebelum retry
+MAX_RETRIES_ON_429 = 2        # maks percobaan ulang setelah 429
+
+# Cache hasil Gemini berdasarkan hash perihal → tidak habiskan kuota untuk input sama
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_gemini_call(perihal_hash: str, perihal: str, api_key_hash: str, _api_key: str) -> dict:
+    """Wrapper cache untuk call_gemini. Cache 1 jam berdasarkan hash perihal."""
+    return _call_gemini_raw(perihal, _api_key)
+
+def _call_gemini_raw(perihal: str, api_key: str) -> dict:
     """
-    Single Gemini API call to:
-    1. Extract inti surat
-    2. Select best primer
-    3. Select best sekunder from that primer
-    Returns dict: {inti_surat, primer, sekunder, alasan_primer, alasan_sekunder}
-    Auto-fallback: tries 2.5-flash first, then 2.0-flash if unavailable.
+    Eksekusi REST call ke Gemini API dengan:
+    - Auto-fallback 3 model (2.5-flash → 2.0-flash → 1.5-flash)
+    - Auto-retry dengan countdown jika hit 429 (rate limit)
     """
     primer_sekunder_list = build_primer_sekunder_text()
 
@@ -222,11 +237,11 @@ def call_gemini(perihal: str, api_key: str) -> dict:
         "1. Baca perihal/uraian surat.\n"
         "2. Tentukan INTI SURAT: frasa singkat (maks 8 kata) yang menangkap esensi pokok surat. "
         "Inti surat harus padat, tidak bertele-tele, dan langsung ke poin utama.\n"
-        "3. Dari daftar KODE PRIMER (000–900), pilih 1 kode primer yang paling sesuai dengan inti surat.\n"
-        "4. Dari daftar KODE SEKUNDER di bawah primer terpilih, pilih 1 kode sekunder yang paling spesifik.\n\n"
+        "3. Dari daftar KODE PRIMER (000–900), pilih 1 kode primer yang paling sesuai.\n"
+        "4. Dari daftar KODE SEKUNDER di bawah primer terpilih, pilih 1 kode sekunder paling spesifik.\n\n"
         "ATURAN PENTING:\n"
         "- Kode sekunder WAJIB merupakan anak langsung dari primer terpilih (prefix sama).\n"
-        "- Jawab HANYA dalam format JSON berikut, tanpa teks tambahan:\n"
+        "- Jawab HANYA dalam format JSON, tanpa teks tambahan:\n"
         '{"inti_surat":"...","primer":"000","sekunder":"000.1","alasan_primer":"...","alasan_sekunder":"..."}'
     )
 
@@ -236,15 +251,8 @@ def call_gemini(perihal: str, api_key: str) -> dict:
     )
 
     rest_payload = {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": user_message}]
-            }
-        ],
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
         "generationConfig": {
             "maxOutputTokens": 400,
             "temperature": 0.1,
@@ -252,53 +260,72 @@ def call_gemini(perihal: str, api_key: str) -> dict:
         }
     }
 
-    # Model fallback order: 2.5-flash-preview → 2.0-flash → 1.5-flash
-    # Nama model yang benar sesuai dokumentasi Gemini REST API
+    # Urutan model: 2.5-flash preview → 2.0-flash (stabil) → 1.5-flash (paling stabil)
     MODELS = [
-        "gemini-2.5-flash-preview-05-20",   # Gemini 2.5 Flash (terbaru, free tier)
-        "gemini-2.0-flash",                  # Gemini 2.0 Flash (stabil, free tier)
-        "gemini-1.5-flash",                  # Gemini 1.5 Flash (fallback terakhir)
+        "gemini-2.5-flash-preview-05-20",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
     ]
 
-    last_error = None
     for model_name in MODELS:
         url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{model_name}:generateContent?key={api_key}"
         )
-        try:
-            resp = requests.post(url, json=rest_payload, timeout=30)
-            if resp.status_code in (503, 404, 429):
-                # 503 = model belum tersedia/overload, 404 = nama model salah
-                # 429 = rate limit, tidak perlu coba model lain
-                if resp.status_code == 429:
-                    raise requests.exceptions.HTTPError(response=resp)
-                last_error = f"Model {model_name} tidak tersedia (HTTP {resp.status_code}), mencoba model berikutnya..."
-                continue
-            resp.raise_for_status()
+        retries_left = MAX_RETRIES_ON_429
 
+        while retries_left >= 0:
+            resp = requests.post(url, json=rest_payload, timeout=30)
+
+            # 429 → Rate limit: tunggu dan retry
+            if resp.status_code == 429:
+                if retries_left > 0:
+                    retries_left -= 1
+                    # Tampilkan countdown di UI (countdown via Streamlit status)
+                    wait_placeholder = st.empty()
+                    for remaining in range(RETRY_WAIT_SECONDS, 0, -1):
+                        wait_placeholder.warning(
+                            f"⏳ **Kuota Gemini sementara penuh (rate limit).** "
+                            f"Mencoba otomatis dalam **{remaining} detik**... "
+                            f"(percobaan tersisa: {retries_left})"
+                        )
+                        time.sleep(1)
+                    wait_placeholder.empty()
+                    continue  # retry
+                else:
+                    # Habis retry, raise ke caller
+                    raise requests.exceptions.HTTPError(response=resp)
+
+            # 503/404 → model tidak tersedia, coba model berikutnya
+            if resp.status_code in (503, 404):
+                break  # keluar dari while, lanjut ke model berikutnya
+
+            # Error lain (403, 500, dst)
+            if not resp.ok:
+                resp.raise_for_status()
+
+            # Sukses → parse response
             data = resp.json()
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-            # Simpan info model yang berhasil dipakai ke session state
             st.session_state["model_used"] = model_name
-
-            # Bersihkan markdown fence jika ada
             raw_text = re.sub(r"^```json\s*", "", raw_text)
             raw_text = re.sub(r"\s*```$", "", raw_text)
-            result = json.loads(raw_text)
-            return result
+            return json.loads(raw_text)
 
-        except requests.exceptions.HTTPError:
-            raise
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-    # Semua model gagal
     raise RuntimeError(
-        f"Semua model Gemini tidak dapat dihubungi. Error terakhir: {last_error}"
+        "Semua model Gemini tidak dapat dihubungi (503/404). "
+        "Kemungkinan Google AI Studio sedang gangguan. Coba beberapa menit lagi."
     )
+
+
+def call_gemini(perihal: str, api_key: str) -> dict:
+    """Entry point dengan cache. Perihal identik tidak akan re-call API."""
+    # Hash perihal untuk cache key (tidak expose isi ke cache key secara langsung)
+    perihal_hash = hashlib.md5(perihal.strip().lower().encode()).hexdigest()
+    api_key_hash = hashlib.md5(api_key.encode()).hexdigest()
+    return cached_gemini_call(perihal_hash, perihal.strip(), api_key_hash, api_key)
+
+
 
 def local_classify(inti_surat: str, sekunder_kode: str, top_n: int = 3) -> list[dict]:
     """
@@ -413,28 +440,66 @@ with col2:
     cari = st.button("🔍 Tentukan Kode Klasifikasi", use_container_width=True, type="primary")
 
 # ─── Proses Klasifikasi ───────────────────────────────────────────────────────
+# Inisialisasi cooldown di session state
+if "last_submit_time" not in st.session_state:
+    st.session_state["last_submit_time"] = 0
+
 if cari:
     if not perihal_input.strip():
         st.markdown('<div class="warning-box">⚠️ Mohon isi perihal surat terlebih dahulu.</div>', unsafe_allow_html=True)
     elif not gemini_api_key:
         st.markdown('<div class="error-box">🔑 API Key Gemini belum dikonfigurasi.</div>', unsafe_allow_html=True)
     else:
+        # ── Cek cooldown antar submit ──────────────────────────────────────────
+        elapsed = time.time() - st.session_state["last_submit_time"]
+        if elapsed < COOLDOWN_SECONDS:
+            sisa = int(COOLDOWN_SECONDS - elapsed) + 1
+            st.warning(
+                f"⏱️ Mohon tunggu **{sisa} detik** sebelum mengirim permintaan baru "
+                f"(batas Gemini free tier: maks 10 request/menit)."
+            )
+            st.stop()
+
+        st.session_state["last_submit_time"] = time.time()
+
+        # ── Cek apakah hasil ini sudah di-cache ───────────────────────────────
+        perihal_hash = hashlib.md5(perihal_input.strip().lower().encode()).hexdigest()
+        is_cached = perihal_hash in st.session_state.get("cache_hits", set())
+
         with st.spinner("🤖 Menganalisis perihal surat dengan Gemini AI..."):
             try:
                 gemini_result = call_gemini(perihal_input.strip(), gemini_api_key)
+                # Tandai hash ini sebagai cached untuk session ini
+                if "cache_hits" not in st.session_state:
+                    st.session_state["cache_hits"] = set()
+                st.session_state["cache_hits"].add(perihal_hash)
+
             except requests.exceptions.HTTPError as e:
                 code = e.response.status_code if e.response is not None else 0
                 if code == 429:
-                    st.error("⏳ **Batas kuota Gemini tercapai.** Tunggu 1 menit lalu coba lagi (free tier: 15 request/menit).")
+                    st.error(
+                        "⏳ **Kuota harian/menit Gemini habis setelah percobaan ulang otomatis.**\n\n"
+                        "Ini terjadi karena:\n"
+                        "- **Free tier limit:** 10 RPM untuk Gemini 2.5 Flash Preview\n"
+                        "- **1.500 request/hari** untuk semua model\n\n"
+                        "**Solusi:**\n"
+                        "- Tunggu 1–2 menit lalu coba lagi\n"
+                        "- Jika sudah sering dipakai hari ini, tunggu hingga besok (reset pukul 00.00 UTC / 07.00 WITA)\n"
+                        "- Pertimbangkan upgrade ke Gemini API berbayar jika kebutuhan tinggi"
+                    )
                 elif code == 403:
-                    st.error("🔑 **API Key tidak valid.** Pastikan key sudah benar dan Gemini API sudah diaktifkan di Google AI Studio.")
+                    st.error(
+                        "🔑 **API Key tidak valid atau tidak diizinkan.**\n\n"
+                        "Pastikan:\n"
+                        "- Key sudah benar (tidak ada spasi)\n"
+                        "- Gemini API sudah diaktifkan di [Google AI Studio](https://aistudio.google.com)\n"
+                        "- Key belum direvoke"
+                    )
                 elif code in (503, 404):
                     st.error(
                         f"❌ **Semua model Gemini tidak dapat dihubungi (HTTP {code}).**\n\n"
-                        "Kemungkinan penyebab:\n"
-                        "- Google AI Studio sedang gangguan (cek [status.google.com](https://status.google.com))\n"
-                        "- Koneksi internet bermasalah\n\n"
-                        "Silakan coba beberapa saat lagi."
+                        "Cek status layanan di [status.cloud.google.com](https://status.cloud.google.com). "
+                        "Silakan coba beberapa menit lagi."
                     )
                 else:
                     st.error(f"❌ Error HTTP {code}: {e}")
@@ -446,9 +511,10 @@ if cari:
                 st.error(f"❌ Terjadi kesalahan tak terduga: {e}")
                 st.stop()
 
-        # Tampilkan model yang berhasil dipakai
-        model_used = st.session_state.get("model_used", "gemini-2.5-flash-preview-05-20")
-        st.caption(f"✅ Dianalisis menggunakan: `{model_used}`")
+        # Tampilkan info model dan status cache
+        model_used = st.session_state.get("model_used", "—")
+        cache_label = "♻️ Dari cache (tidak menggunakan kuota)" if is_cached else "✅ Baru dianalisis"
+        st.caption(f"{cache_label} · Model: `{model_used}`")
 
         inti_surat = gemini_result.get("inti_surat", "").strip()
         primer_kode = gemini_result.get("primer", "").strip()
