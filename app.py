@@ -23,8 +23,12 @@ def load_database():
 e5_model = load_engine()
 df, corpus_embeddings = load_database()
 
+# Pastikan vektor di CPU untuk menghindari error PyTorch
+if not isinstance(corpus_embeddings, torch.Tensor):
+    corpus_embeddings = torch.tensor(corpus_embeddings)
+corpus_embeddings = corpus_embeddings.cpu()
+
 # --- INISIALISASI KLIEN GEMINI ---
-# Mengambil API Key dari brankas Streamlit
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     client = genai.Client(api_key=api_key)
@@ -37,68 +41,84 @@ st.title("📂 SIKAP AI")
 st.subheader("Sistem Informasi Klasifikasi Arsip Pintar - Muna Barat")
 st.markdown("---")
 
-query_user = st.text_area("Masukkan perihal surat:", placeholder="Contoh: permohonan sertifikasi tanah untuk gedung perpustakaan...")
+query_user = st.text_area("Masukkan perihal surat:", placeholder="Contoh: permohonan surat sertifikasi tanah untuk pembangunan gedung perpustakaan...")
 
 if st.button("Cari Kode (AI Reasoning)", type="primary"):
     if query_user.strip() != "":
-        with st.spinner('Langkah 1: Menyortir ribuan dokumen...'):
-            # 1. E5 mengambil 10 kandidat terbaik
-            query_text = f"query: {query_user}"
-            query_embedding = e5_model.encode(query_text, convert_to_tensor=True)
-            cos_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
-            top_results = torch.topk(cos_scores, k=10)
-            
-            # Susun daftar kandidat
-            kandidat_list = ""
-            for urutan, idx in enumerate(top_results.indices, 1):
-                res_idx = idx.item()
-                baris = df.iloc[res_idx]
-                kandidat_list += f"{urutan}. Kode: {baris['kode']} | Uraian: {baris['uraian']} | Jalur: {baris['breadcrumb']}\n"
-                
-        with st.spinner('Langkah 2: Hakim AI (Gemini 2.5 Flash) sedang menalar...'):
-            if client is not None:
+        if client is not None:
+            with st.spinner('Tahap 1: AI merumuskan inti pencarian (Intent Extraction)...'):
                 try:
-                    # 2. Instruksi ketat untuk Gemini 2.5 Flash
-                    prompt = f"""
-                    Kamu adalah Arsiparis Senior di Pemerintahan Kabupaten Muna Barat.
-                    Seorang pegawai menanyakan kode klasifikasi arsip untuk surat tentang: "{query_user}"
+                    # 1. RESEPSIONIS: Ekstrak kata kunci inti
+                    prompt_ekstraksi = f"""
+                    Ekstrak inti urusan dari perihal surat berikut dalam 1 sampai 3 kata saja untuk pencarian database.
+                    Abaikan kata pengantar, lokasi, atau tujuan akhir (seperti: surat, permohonan, undangan, untuk, pembangunan, gedung).
+                    Perihal: "{query_user}"
+                    Format balasan: HANYA tulis kata kuncinya.
+                    Contoh: "permohonan surat cuti tahunan untuk pegawai" -> "cuti tahunan"
+                    """
                     
-                    Mesin pencari kami menemukan 10 kandidat kode berdasarkan kedekatan teks:
+                    response_ekstraksi = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=prompt_ekstraksi,
+                    )
+                    kata_kunci_inti = response_ekstraksi.text.strip().lower()
+                    
+                    st.info(f"🔍 Mesin mencari dengan kata kunci inti yang diekstrak: **{kata_kunci_inti}**")
+                    
+                    # 2. PENCARIAN VEKTOR MENGGUNAKAN KATA KUNCI INTI
+                    query_text = f"query: {kata_kunci_inti}"
+                    query_embedding = e5_model.encode(query_text, convert_to_tensor=True).cpu()
+                    cos_scores = util.cos_sim(query_embedding, corpus_embeddings)[0]
+                    top_results = torch.topk(cos_scores, k=10)
+                    
+                    kandidat_list = ""
+                    for urutan, idx in enumerate(top_results.indices, 1):
+                        res_idx = idx.item()
+                        baris = df.iloc[res_idx]
+                        kandidat_list += f"{urutan}. Kode: {baris['kode']} | Uraian: {baris['uraian']} | Jalur: {baris['breadcrumb']}\n"
+                        
+                except Exception as e:
+                    st.error(f"Gagal mengekstrak kata kunci. Detail: {e}")
+                    st.stop()
+                    
+            with st.spinner('Tahap 2: Hakim AI sedang memvonis jawaban terbaik...'):
+                try:
+                    # 3. HAKIM FINAL: Menentukan jawaban dari 10 kandidat yang sudah difilter
+                    prompt_hakim = f"""
+                    Kamu adalah Arsiparis Senior Muna Barat.
+                    Pegawai mencari kode untuk urusan asli: "{query_user}"
+                    
+                    Berikut 10 kandidat kode terbaik dari database kami:
                     {kandidat_list}
                     
                     Tugasmu:
-                    1. Analisis perihal surat pegawai tersebut.
-                    2. Pilih SATU kode klasifikasi yang paling akurat dari 10 kandidat di atas.
-                    3. Jika surat terkait sertifikasi/pengadaan tanah untuk bangunan pemerintah, pilih urusan Pertanahan, bukan sertifikasi profesi atau pinjaman uang.
+                    Pilih 1 kode yang paling tepat mewakili urusan asli pegawai.
+                    Jika urusannya tentang pengadaan/sertifikasi lahan/tanah, pastikan pilih jalur Pertanahan.
                     
-                    Format balasanmu persis seperti ini (tanpa basa-basi):
-                    KODE FINAL: [Tulis kodenya saja, misal 500.17.3]
+                    Format balasan:
+                    KODE FINAL: [Tulis kodenya saja]
                     URAIAN: [Tulis uraian resminya]
-                    ALASAN: [Jelaskan secara singkat mengapa kode ini paling tepat dan mengapa kandidat lain salah]
+                    ALASAN: [Jelaskan 2 kalimat mengapa ini yang paling tepat]
                     """
                     
-                    # Memanggil Gemini menggunakan SDK google-genai terbaru
-                    response = client.models.generate_content(
+                    response_hakim = client.models.generate_content(
                         model='gemini-2.5-flash',
-                        contents=prompt,
+                        contents=prompt_hakim,
                     )
                     
-                    hasil_hakim = response.text
-                    
-                    # Tampilkan hasil akhir
                     st.success("✨ Analisis Selesai!")
                     st.markdown(f"""
                     <div style="padding:20px; background-color:#f0f8ff; border-left: 5px solid #0056b3; border-radius: 5px;">
-                        {hasil_hakim}
+                        {response_hakim.text}
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    with st.expander("Lihat 10 kandidat yang disortir mesin E5 (Bahan Evaluasi)"):
+                    with st.expander("Lihat 10 kandidat yang disortir mesin (Bahan Evaluasi)"):
                         st.text(kandidat_list)
                         
                 except Exception as e:
-                    st.error(f"Koneksi ke Gemini gagal. Detail error: {e}")
-            else:
-                st.error("Sistem Hakim AI tidak dapat berjalan karena API Key belum dikonfigurasi.")
+                    st.error(f"Koneksi Hakim AI gagal. Detail: {e}")
+        else:
+            st.error("API Key belum terpasang di Secrets.")
     else:
         st.error("Silakan masukkan perihal surat terlebih dahulu.")
