@@ -211,6 +211,7 @@ def call_gemini(perihal: str, api_key: str) -> dict:
     2. Select best primer
     3. Select best sekunder from that primer
     Returns dict: {inti_surat, primer, sekunder, alasan_primer, alasan_sekunder}
+    Auto-fallback: tries 2.5-flash first, then 2.0-flash if unavailable.
     """
     primer_sekunder_list = build_primer_sekunder_text()
 
@@ -234,22 +235,6 @@ def call_gemini(perihal: str, api_key: str) -> dict:
         f"DAFTAR KODE KLASIFIKASI (PRIMER DAN SEKUNDER):\n{primer_sekunder_list}"
     )
 
-    payload = {
-        "model": "gemini-2.5-flash",
-        "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": user_message}
-        ],
-        "generationConfig": {
-            "maxOutputTokens": 300,
-            "temperature": 0.1,
-            "responseMimeType": "application/json"
-        }
-    }
-
-    # Use Gemini REST API directly (google-generativeai format via REST)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-
     rest_payload = {
         "system_instruction": {
             "parts": [{"text": system_prompt}]
@@ -267,19 +252,53 @@ def call_gemini(perihal: str, api_key: str) -> dict:
         }
     }
 
-    resp = requests.post(url, json=rest_payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    # Model fallback order: 2.5-flash-preview → 2.0-flash → 1.5-flash
+    # Nama model yang benar sesuai dokumentasi Gemini REST API
+    MODELS = [
+        "gemini-2.5-flash-preview-05-20",   # Gemini 2.5 Flash (terbaru, free tier)
+        "gemini-2.0-flash",                  # Gemini 2.0 Flash (stabil, free tier)
+        "gemini-1.5-flash",                  # Gemini 1.5 Flash (fallback terakhir)
+    ]
 
-    # Extract text from response
-    raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    last_error = None
+    for model_name in MODELS:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:generateContent?key={api_key}"
+        )
+        try:
+            resp = requests.post(url, json=rest_payload, timeout=30)
+            if resp.status_code in (503, 404, 429):
+                # 503 = model belum tersedia/overload, 404 = nama model salah
+                # 429 = rate limit, tidak perlu coba model lain
+                if resp.status_code == 429:
+                    raise requests.exceptions.HTTPError(response=resp)
+                last_error = f"Model {model_name} tidak tersedia (HTTP {resp.status_code}), mencoba model berikutnya..."
+                continue
+            resp.raise_for_status()
 
-    # Parse JSON
-    # Remove possible markdown fences
-    raw_text = re.sub(r"^```json\s*", "", raw_text)
-    raw_text = re.sub(r"\s*```$", "", raw_text)
-    result = json.loads(raw_text)
-    return result
+            data = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            # Simpan info model yang berhasil dipakai ke session state
+            st.session_state["model_used"] = model_name
+
+            # Bersihkan markdown fence jika ada
+            raw_text = re.sub(r"^```json\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+            result = json.loads(raw_text)
+            return result
+
+        except requests.exceptions.HTTPError:
+            raise
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    # Semua model gagal
+    raise RuntimeError(
+        f"Semua model Gemini tidak dapat dihubungi. Error terakhir: {last_error}"
+    )
 
 def local_classify(inti_surat: str, sekunder_kode: str, top_n: int = 3) -> list[dict]:
     """
@@ -404,16 +423,32 @@ if cari:
             try:
                 gemini_result = call_gemini(perihal_input.strip(), gemini_api_key)
             except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429:
-                    st.error("⏳ Batas kuota Gemini tercapai. Coba beberapa saat lagi.")
-                elif e.response.status_code == 403:
-                    st.error("🔑 API Key tidak valid atau tidak memiliki akses ke Gemini.")
+                code = e.response.status_code if e.response is not None else 0
+                if code == 429:
+                    st.error("⏳ **Batas kuota Gemini tercapai.** Tunggu 1 menit lalu coba lagi (free tier: 15 request/menit).")
+                elif code == 403:
+                    st.error("🔑 **API Key tidak valid.** Pastikan key sudah benar dan Gemini API sudah diaktifkan di Google AI Studio.")
+                elif code in (503, 404):
+                    st.error(
+                        f"❌ **Semua model Gemini tidak dapat dihubungi (HTTP {code}).**\n\n"
+                        "Kemungkinan penyebab:\n"
+                        "- Google AI Studio sedang gangguan (cek [status.google.com](https://status.google.com))\n"
+                        "- Koneksi internet bermasalah\n\n"
+                        "Silakan coba beberapa saat lagi."
+                    )
                 else:
-                    st.error(f"❌ Gagal menghubungi Gemini API: {e}")
+                    st.error(f"❌ Error HTTP {code}: {e}")
+                st.stop()
+            except RuntimeError as e:
+                st.error(str(e))
                 st.stop()
             except Exception as e:
-                st.error(f"❌ Terjadi kesalahan: {e}")
+                st.error(f"❌ Terjadi kesalahan tak terduga: {e}")
                 st.stop()
+
+        # Tampilkan model yang berhasil dipakai
+        model_used = st.session_state.get("model_used", "gemini-2.5-flash-preview-05-20")
+        st.caption(f"✅ Dianalisis menggunakan: `{model_used}`")
 
         inti_surat = gemini_result.get("inti_surat", "").strip()
         primer_kode = gemini_result.get("primer", "").strip()
