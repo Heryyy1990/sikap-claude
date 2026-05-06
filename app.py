@@ -208,59 +208,48 @@ def build_primer_sekunder_text() -> str:
 
 
 # ─── Konstanta Rate Limiting ──────────────────────────────────────────────────
-# Gemini Free Tier limits:
-#   - 15 RPM  (requests per minute)  → min jeda 4 detik antar request
-#   - 1.500 RPD (requests per day)
-#   - Gemini 2.5 Flash Preview: lebih ketat, hanya 10 RPM
-COOLDOWN_SECONDS = 6          # jeda minimum antar submit (detik)
+# Gemini Free Tier limits (Gemini 2.5 Flash Preview):
+#   - 10 RPM  → jeda aman 7 detik antar request
+#   - 500 RPD (preview) / 1.500 RPD (2.0-flash)
+# STRATEGI: Gemini HANYA untuk ekstrak inti surat (~100 token/call).
+# Seluruh klasifikasi primer→sekunder→tersier→kuartier dilakukan LOKAL (TF-IDF).
+# Hemat ~85% token dibanding arsitektur lama.
+COOLDOWN_SECONDS = 7          # jeda minimum antar submit
 RETRY_WAIT_SECONDS = 65       # tunggu setelah 429 sebelum retry
 MAX_RETRIES_ON_429 = 2        # maks percobaan ulang setelah 429
 
-# Cache hasil Gemini berdasarkan hash perihal → tidak habiskan kuota untuk input sama
+# ─── Gemini: HANYA Ekstrak Inti Surat ────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_gemini_call(perihal_hash: str, perihal: str, api_key_hash: str, _api_key: str) -> dict:
-    """Wrapper cache untuk call_gemini. Cache 1 jam berdasarkan hash perihal."""
-    return _call_gemini_raw(perihal, _api_key)
+def cached_ekstrak_inti(perihal_hash: str, perihal: str, api_key_hash: str, _api_key: str) -> str:
+    """Cache hasil ekstraksi inti surat selama 1 jam. Input sama = 0 token terpakai."""
+    return _ekstrak_inti_raw(perihal, _api_key)
 
-def _call_gemini_raw(perihal: str, api_key: str) -> dict:
+def _ekstrak_inti_raw(perihal: str, api_key: str) -> str:
     """
-    Eksekusi REST call ke Gemini API dengan:
-    - Auto-fallback 3 model (2.5-flash → 2.0-flash → 1.5-flash)
-    - Auto-retry dengan countdown jika hit 429 (rate limit)
+    Satu-satunya panggilan ke Gemini API.
+    Tugas tunggal: ubah perihal surat → inti surat (maks 8 kata).
+    Prompt sangat kecil: ~100 token input, ~20 token output.
     """
-    primer_sekunder_list = build_primer_sekunder_text()
-
     system_prompt = (
-        "Anda adalah arsiparis ahli Pemerintah Kabupaten Muna Barat. "
-        "Tugas Anda adalah menentukan kode klasifikasi arsip untuk surat yang masuk.\n\n"
-        "TUGAS:\n"
-        "1. Baca perihal/uraian surat.\n"
-        "2. Tentukan INTI SURAT: frasa singkat (maks 8 kata) yang menangkap esensi pokok surat. "
-        "Inti surat harus padat, tidak bertele-tele, dan langsung ke poin utama.\n"
-        "3. Dari daftar KODE PRIMER (000–900), pilih 1 kode primer yang paling sesuai.\n"
-        "4. Dari daftar KODE SEKUNDER di bawah primer terpilih, pilih 1 kode sekunder paling spesifik.\n\n"
-        "ATURAN PENTING:\n"
-        "- Kode sekunder WAJIB merupakan anak langsung dari primer terpilih (prefix sama).\n"
-        "- Jawab HANYA dalam format JSON, tanpa teks tambahan:\n"
-        '{"inti_surat":"...","primer":"000","sekunder":"000.1","alasan_primer":"...","alasan_sekunder":"..."}'
-    )
-
-    user_message = (
-        f"PERIHAL SURAT:\n{perihal}\n\n"
-        f"DAFTAR KODE KLASIFIKASI (PRIMER DAN SEKUNDER):\n{primer_sekunder_list}"
+        "Anda adalah arsiparis. Tugas Anda satu: baca perihal surat dan tulis INTI SURAT-nya.\n"
+        "INTI SURAT harus:\n"
+        "- Maksimal 8 kata\n"
+        "- Berupa frasa ringkas yang menangkap pokok/esensi surat\n"
+        "- Gunakan kata kunci birokrasi yang tepat (bukan kalimat panjang)\n"
+        "- Contoh: 'perjalanan dinas pegawai luar negeri', 'pengadaan kendaraan dinas operasional', "
+        "'bantuan operasional sekolah SD'\n"
+        "Jawab HANYA dengan inti surat, tanpa tanda kutip, tanpa penjelasan."
     )
 
     rest_payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "contents": [{"role": "user", "parts": [{"text": perihal}]}],
         "generationConfig": {
-            "maxOutputTokens": 400,
+            "maxOutputTokens": 50,   # inti surat max 8 kata → 50 token lebih dari cukup
             "temperature": 0.1,
-            "responseMimeType": "application/json"
         }
     }
 
-    # Urutan model: 2.5-flash preview → 2.0-flash (stabil) → 1.5-flash (paling stabil)
     MODELS = [
         "gemini-2.5-flash-preview-05-20",
         "gemini-2.0-flash",
@@ -275,42 +264,35 @@ def _call_gemini_raw(perihal: str, api_key: str) -> dict:
         retries_left = MAX_RETRIES_ON_429
 
         while retries_left >= 0:
-            resp = requests.post(url, json=rest_payload, timeout=30)
+            resp = requests.post(url, json=rest_payload, timeout=20)
 
-            # 429 → Rate limit: tunggu dan retry
             if resp.status_code == 429:
                 if retries_left > 0:
                     retries_left -= 1
-                    # Tampilkan countdown di UI (countdown via Streamlit status)
                     wait_placeholder = st.empty()
                     for remaining in range(RETRY_WAIT_SECONDS, 0, -1):
                         wait_placeholder.warning(
-                            f"⏳ **Kuota Gemini sementara penuh (rate limit).** "
-                            f"Mencoba otomatis dalam **{remaining} detik**... "
+                            f"⏳ **Kuota Gemini sementara penuh.** "
+                            f"Retry otomatis dalam **{remaining} detik**... "
                             f"(percobaan tersisa: {retries_left})"
                         )
                         time.sleep(1)
                     wait_placeholder.empty()
-                    continue  # retry
+                    continue
                 else:
-                    # Habis retry, raise ke caller
                     raise requests.exceptions.HTTPError(response=resp)
 
-            # 503/404 → model tidak tersedia, coba model berikutnya
             if resp.status_code in (503, 404):
-                break  # keluar dari while, lanjut ke model berikutnya
+                break   # coba model berikutnya
 
-            # Error lain (403, 500, dst)
             if not resp.ok:
                 resp.raise_for_status()
 
-            # Sukses → parse response
             data = resp.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            inti = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            inti = inti.strip('"').strip("'")   # bersihkan kutip nakal
             st.session_state["model_used"] = model_name
-            raw_text = re.sub(r"^```json\s*", "", raw_text)
-            raw_text = re.sub(r"\s*```$", "", raw_text)
-            return json.loads(raw_text)
+            return inti
 
     raise RuntimeError(
         "Semua model Gemini tidak dapat dihubungi (503/404). "
@@ -318,21 +300,154 @@ def _call_gemini_raw(perihal: str, api_key: str) -> dict:
     )
 
 
-def call_gemini(perihal: str, api_key: str) -> dict:
-    """Entry point dengan cache. Perihal identik tidak akan re-call API."""
-    # Hash perihal untuk cache key (tidak expose isi ke cache key secara langsung)
-    perihal_hash = hashlib.md5(perihal.strip().lower().encode()).hexdigest()
-    api_key_hash = hashlib.md5(api_key.encode()).hexdigest()
-    return cached_gemini_call(perihal_hash, perihal.strip(), api_key_hash, api_key)
+def ekstrak_inti_surat(perihal: str, api_key: str) -> str:
+    """Entry point dengan cache hash."""
+    h_perihal = hashlib.md5(perihal.strip().lower().encode()).hexdigest()
+    h_key = hashlib.md5(api_key.encode()).hexdigest()
+    return cached_ekstrak_inti(h_perihal, perihal.strip(), h_key, api_key)
 
 
-
-def local_classify(inti_surat: str, sekunder_kode: str, top_n: int = 3) -> list[dict]:
+# ─── Klasifikasi Lokal Penuh: Primer → Sekunder → Tersier → Kuartier ─────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_level_index():
     """
-    Local TF-IDF classification from sekunder down to kuartier.
-    Returns top_n recommendations, each with full path.
+    Bangun indeks TF-IDF per level, di-cache selamanya (data statis).
+    Hasil: dict berisi vectorizer dan matrix per level + per parent.
+    Dijalankan sekali saat startup, tidak pernah ulang selama app hidup.
     """
-    recommendations = []
+    index = {"primer": [], "sekunder": [], "tersier": [], "kuartier": []}
+    for kode, data in lookup.items():
+        lv = data["level"]
+        if lv in index:
+            index[lv].append({
+                "kode": kode,
+                "uraian": data["uraian"],
+                "search": data.get("search", data["uraian"]),
+                "parent": data.get("parent", ""),
+                "path": data.get("path", kode),
+            })
+    return index
+
+def tfidf_top(query: str, candidates: list[dict], top_n: int = 3) -> list[dict]:
+    """
+    TF-IDF cosine similarity. candidates = list of dict {kode, uraian, search, ...}
+    Returns top_n sorted by score descending, dengan field 'score' ditambahkan.
+    """
+    if not candidates:
+        return []
+    if len(candidates) == 1:
+        return [{**candidates[0], "score": 1.0}]
+
+    texts = [c["search"] for c in candidates]
+    try:
+        vec = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), min_df=1)
+        mat = vec.fit_transform([query] + texts)
+        sims = cosine_similarity(mat[0:1], mat[1:]).flatten()
+    except Exception:
+        q_words = set(query.lower().split())
+        sims = np.array([
+            len(q_words & set(t.lower().split())) / max(len(q_words), 1)
+            for t in texts
+        ])
+
+    top_n = min(top_n, len(candidates))
+    top_idx = sims.argsort()[::-1][:top_n]
+    return [{**candidates[i], "score": float(sims[i])} for i in top_idx]
+
+def klasifikasi_lokal(inti_surat: str, top_n: int = 3) -> tuple[str, str, list[dict]]:
+    """
+    Klasifikasi hierarki penuh secara lokal tanpa API.
+
+    Alur:
+      inti_surat
+        → TF-IDF vs seluruh primer (10)         → pilih 1 primer terbaik
+        → TF-IDF vs sekunder anak primer (5-17)  → pilih 1 sekunder terbaik
+        → TF-IDF vs tersier anak sekunder        → ambil top_n
+        → per tersier: TF-IDF vs kuartier anak   → ambil 1 terbaik
+        → hasilkan top_n rekomendasi final
+
+    Returns: (primer_kode, sekunder_kode, [rekomendasi])
+    """
+    idx = build_level_index()
+
+    # ── Langkah 1: Pilih Primer ───────────────────────────────────────────────
+    # Untuk primer, enriched search = gabungan uraian semua sekunder anaknya
+    # supaya "pertanian" bisa ditangkap walau kata itu tidak ada di uraian primer
+    primer_candidates = []
+    for item in idx["primer"]:
+        # Kumpulkan uraian semua sekunder + tersier di bawah primer ini sebagai konteks
+        child_texts = " ".join(
+            c["search"] for c in idx["sekunder"] if c["parent"] == item["kode"]
+        )
+        enriched = f"{item['uraian']} {child_texts}"
+        primer_candidates.append({**item, "search": enriched})
+
+    top_primer = tfidf_top(inti_surat, primer_candidates, top_n=1)
+    primer_kode = top_primer[0]["kode"] if top_primer else "000"
+
+    # ── Langkah 2: Pilih Sekunder dari Primer Terpilih ────────────────────────
+    sek_candidates = [c for c in idx["sekunder"] if c["parent"] == primer_kode]
+    if not sek_candidates:
+        # Fallback: gunakan primer sebagai hasil
+        p_data = lookup.get(primer_kode, {})
+        return primer_kode, primer_kode, [{
+            "kode": primer_kode, "uraian": p_data.get("uraian", ""),
+            "path": p_data.get("path", primer_kode),
+            "level": "primer (fallback)", "score": top_primer[0]["score"] if top_primer else 0,
+            "tersier_kode": None, "tersier_uraian": None,
+        }]
+
+    # Enrichment sekunder: tambahkan uraian tersier anaknya
+    sek_enriched = []
+    for s in sek_candidates:
+        child_texts = " ".join(
+            c["search"] for c in idx["tersier"] if c["parent"] == s["kode"]
+        )
+        sek_enriched.append({**s, "search": f"{s['search']} {child_texts}"})
+
+    top_sek = tfidf_top(inti_surat, sek_enriched, top_n=1)
+    sekunder_kode = top_sek[0]["kode"] if top_sek else sek_candidates[0]["kode"]
+
+    # ── Langkah 3 & 4: Tersier + Kuartier ────────────────────────────────────
+    ter_candidates = [c for c in idx["tersier"] if c["parent"] == sekunder_kode]
+    if not ter_candidates:
+        sek_data = lookup.get(sekunder_kode, {})
+        return primer_kode, sekunder_kode, [{
+            "kode": sekunder_kode, "uraian": sek_data.get("uraian", ""),
+            "path": sek_data.get("path", sekunder_kode),
+            "level": "sekunder (fallback)", "score": top_sek[0]["score"] if top_sek else 0,
+            "tersier_kode": None, "tersier_uraian": None,
+        }]
+
+    top_tersier = tfidf_top(inti_surat, ter_candidates, top_n=top_n)
+
+    rekomendasi = []
+    for t in top_tersier:
+        t_kode = t["kode"]
+        kuar_candidates = [c for c in idx["kuartier"] if c["parent"] == t_kode]
+
+        if kuar_candidates:
+            top_k = tfidf_top(inti_surat, kuar_candidates, top_n=1)
+            if top_k:
+                k = top_k[0]
+                combined = t["score"] * 0.35 + k["score"] * 0.65
+                rekomendasi.append({
+                    "kode": k["kode"], "uraian": k["uraian"],
+                    "path": k["path"], "level": "kuartier",
+                    "score": combined,
+                    "tersier_kode": t_kode, "tersier_uraian": t["uraian"],
+                })
+        else:
+            rekomendasi.append({
+                "kode": t_kode, "uraian": t["uraian"],
+                "path": t["path"], "level": "tersier (fallback)",
+                "score": t["score"],
+                "tersier_kode": t_kode, "tersier_uraian": t["uraian"],
+            })
+
+    return primer_kode, sekunder_kode, rekomendasi[:top_n]
+
+
 
     # Get tersier children of chosen sekunder
     tersier_candidates = get_children_of(sekunder_kode, "tersier")
